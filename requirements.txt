@@ -3,7 +3,6 @@ python-dotenv
 requests
 fpdf
 gunicorn
-Flask-Mail
 itsdangerous
 werkzeug
-python-dotenv
+resend
