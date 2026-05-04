@@ -9,7 +9,7 @@ import logging
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for, make_response, flash
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.middleware.proxy_fix import ProxyFix          # ← fixes https behind Render proxy
+from werkzeug.middleware.proxy_fix import ProxyFix
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 from fpdf import FPDF
 
@@ -18,30 +18,27 @@ from spin import spin_bp
 load_dotenv()
 
 app = Flask(__name__)
-
-# ─── ProxyFix: tells Flask it's behind Render's HTTPS reverse proxy ───────────
-# Without this, url_for(_external=True) generates http:// instead of https://
-# and session cookies may not work correctly.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-
 app.secret_key = os.getenv("SECRET_KEY", "dev_secret_key_CHANGE_ME")
 
 DB_PATH = os.getenv("DB_PATH", "app_database.db")
 app.register_blueprint(spin_bp)
 
-# ─── Cookie settings ──────────────────────────────────────────────────────────
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE']   = bool(os.getenv("RENDER"))   # True only on live HTTPS
+app.config['SESSION_COOKIE_SECURE']   = bool(os.getenv("RENDER"))
 app.config['SESSION_COOKIE_HTTPONLY'] = True
-# NOTE: do NOT set SERVER_NAME — it breaks all routes on Render
 
-# ─── Flask-Mail (optional — gracefully disabled if env vars missing) ───────────
-MAIL_ENABLED  = False
-mail          = None
-_MailMessage  = None
+# ── Flask-Mail ─────────────────────────────────────────────────────────────────
+MAIL_ENABLED = False
+mail         = None
+_MailMessage = None
 
-_mail_user = os.getenv("MAIL_USERNAME", "gainpesa@gmail.com")
-_mail_pass = os.getenv("MAIL_PASSWORD", "")
+# Read WITHOUT any default — empty string would pass the `if` check falsely
+_mail_user = os.getenv("MAIL_USERNAME")
+_mail_pass = os.getenv("MAIL_PASSWORD")
+
+print(f"[Mail] MAIL_USERNAME = {_mail_user!r}")
+print(f"[Mail] MAIL_PASSWORD = {'SET (' + str(len(_mail_pass)) + ' chars)' if _mail_pass else 'NOT SET'}")
 
 if _mail_user and _mail_pass:
     try:
@@ -53,29 +50,28 @@ if _mail_user and _mail_pass:
             MAIL_USE_SSL        = False,
             MAIL_USERNAME       = _mail_user,
             MAIL_PASSWORD       = _mail_pass,
-            MAIL_DEFAULT_SENDER = _mail_user,
+            MAIL_DEFAULT_SENDER = os.getenv("MAIL_DEFAULT_SENDER", _mail_user),
             MAIL_SUPPRESS_SEND  = False,
         )
         mail         = Mail(app)
         _MailMessage = __Msg
         MAIL_ENABLED = True
-        print(f"[Mail] Ready. Sender: {_mail_user}")
+        print(f"[Mail] READY — sender: {_mail_user}")
     except Exception as e:
-        print(f"[Mail] Init failed ({e}) — console fallback active.")
+        print(f"[Mail] INIT FAILED: {e}")
 else:
-    print("[Mail] No credentials — console fallback active.")
+    print("[Mail] DISABLED — set MAIL_USERNAME and MAIL_PASSWORD env vars on Render")
 
-# ─── Token serializer ─────────────────────────────────────────────────────────
 serializer = URLSafeTimedSerializer(app.secret_key)
 
-# ─── PayHero ──────────────────────────────────────────────────────────────────
+# ── PayHero ────────────────────────────────────────────────────────────────────
 PAYHERO_BASE_URL   = os.getenv("PAYHERO_BASE_URL",   "https://backend.payhero.co.ke/api/v2")
 PAYHERO_CHANNEL_ID = os.getenv("PAYHERO_CHANNEL_ID", "6532")
 PAYHERO_PROVIDER   = os.getenv("PAYHERO_PROVIDER",   "m-pesa")
 CALLBACK_URL       = ("https://gainpesaapp.onrender.com/callback" if os.getenv("RENDER")
                       else os.getenv("CALLBACK_URL", "https://cedrick-subdiscoid-drake.ngrok-free.de/callback"))
-API_USERNAME       = os.getenv("API_USERNAME")
-API_PASSWORD       = os.getenv("API_PASSWORD", "gMMRAHjO3snOZgQI7kS2xPpLlXLcylaKqaW5CJXd")
+API_USERNAME = os.getenv("API_USERNAME")
+API_PASSWORD = os.getenv("API_PASSWORD", "gMMRAHjO3snOZgQI7kS2xPpLlXLcylaKqaW5CJXd")
 
 ACTIVATION_FEE         = 1.0
 MIN_BINARY_DEPOSIT_KES = round(1.0 * 130.0, 2)
@@ -85,7 +81,7 @@ def get_auth_header():
     return f"Basic {base64.b64encode(f'{API_USERNAME}:{API_PASSWORD}'.encode()).decode()}"
 
 
-# ─── Database ─────────────────────────────────────────────────────────────────
+# ── Database ───────────────────────────────────────────────────────────────────
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -105,38 +101,29 @@ def init_db():
             referred_by TEXT, joined_at TEXT, reset_token TEXT, token_expiry TEXT
         )
     """)
-    for col, td in {"spin_balance":"REAL DEFAULT 0.0","binary_balance":"REAL DEFAULT 0.0",
-                    "binary_deposited":"REAL DEFAULT 0.0","binary_winnings":"REAL DEFAULT 0.0",
-                    "reset_token":"TEXT","token_expiry":"TEXT"}.items():
+    for col, td in {
+        "spin_balance":"REAL DEFAULT 0.0","binary_balance":"REAL DEFAULT 0.0",
+        "binary_deposited":"REAL DEFAULT 0.0","binary_winnings":"REAL DEFAULT 0.0",
+        "reset_token":"TEXT","token_expiry":"TEXT"
+    }.items():
         try: conn.execute(f"ALTER TABLE users ADD COLUMN {col} {td}")
         except: pass
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             ext_ref TEXT PRIMARY KEY, email TEXT, type TEXT DEFAULT 'activation',
-            status TEXT, amount REAL DEFAULT 0.0, FOREIGN KEY(email) REFERENCES users(email)
-        )
+            status TEXT, amount REAL DEFAULT 0.0, FOREIGN KEY(email) REFERENCES users(email))
     """)
     for col, td in [("type","TEXT DEFAULT 'activation'"),("amount","REAL DEFAULT 0.0")]:
         try: conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {td}")
         except: pass
-
     for ddl in [
-        """CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, amount REAL,
-            mpesa_number TEXT, status TEXT, date TEXT, FOREIGN KEY(email) REFERENCES users(email))""",
-        """CREATE TABLE IF NOT EXISTS binary_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, asset TEXT, amount REAL,
-            direction TEXT, status TEXT, payout REAL, timestamp TEXT,
-            FOREIGN KEY(email) REFERENCES users(email))""",
-        """CREATE TABLE IF NOT EXISTS admin_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, admin_username TEXT,
-            target_email TEXT, action_type TEXT, amount REAL, timestamp TEXT)""",
+        "CREATE TABLE IF NOT EXISTS withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, amount REAL, mpesa_number TEXT, status TEXT, date TEXT, FOREIGN KEY(email) REFERENCES users(email))",
+        "CREATE TABLE IF NOT EXISTS binary_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, asset TEXT, amount REAL, direction TEXT, status TEXT, payout REAL, timestamp TEXT, FOREIGN KEY(email) REFERENCES users(email))",
+        "CREATE TABLE IF NOT EXISTS admin_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_username TEXT, target_email TEXT, action_type TEXT, amount REAL, timestamp TEXT)",
     ]:
         conn.execute(ddl)
     conn.commit()
     conn.close()
-
 
 init_db()
 
@@ -172,7 +159,6 @@ def seed_active_users():
 seed_active_users()
 
 
-# ─── Auth decorator ───────────────────────────────────────────────────────────
 def login_required(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
@@ -182,42 +168,22 @@ def login_required(f):
     return decorated
 
 
-# ─── Email helper ─────────────────────────────────────────────────────────────
-def send_reset_email(to_email: str, reset_link: str) -> bool:
-    """Returns True if sent via SMTP. Always prints to console as fallback."""
+def send_reset_email(to_email, reset_link):
     if MAIL_ENABLED and mail and _MailMessage:
         try:
-            msg = _MailMessage(
-                subject="GainPesa – Password Reset Request",
-                recipients=[to_email],
-            )
+            msg = _MailMessage(subject="GainPesa – Password Reset Request", recipients=[to_email])
             msg.body = (
-                f"Hello,\n\n"
-                f"Click the link below to reset your GainPesa password (valid 1 hour):\n\n"
-                f"{reset_link}\n\n"
-                f"If you did not request this, ignore this email.\n\n"
-                f"– The GainPesa Team"
+                f"Hello,\n\nClick below to reset your GainPesa password (valid 1 hour):\n\n"
+                f"{reset_link}\n\nIgnore this if you didn't request it.\n\n– GainPesa Team"
             )
             mail.send(msg)
-            print(f"[Mail] Sent reset email to {to_email}")
+            print(f"[Mail] ✓ Sent to {to_email}")
             return True
         except Exception as e:
+            print(f"[Mail] ✗ SMTP error: {e}")
             app.logger.error(f"[Mail] SMTP error → {to_email}: {e}")
-
-    # Console fallback — always runs, always visible in Render logs
-    separator = "=" * 65
-    print(f"\n{separator}\n[RESET LINK] To: {to_email}\n{reset_link}\n{separator}\n")
+    print(f"\n{'='*65}\n[RESET LINK] To: {to_email}\n{reset_link}\n{'='*65}\n")
     return False
-
-
-# ─── Helper: build reset URL correctly on any host ───────────────────────────
-def build_reset_url(token: str) -> str:
-    """
-    url_for(_external=True) works correctly once ProxyFix is applied —
-    it reads X-Forwarded-Proto from Render's proxy and returns https://.
-    This is the single correct way; no manual host wiring needed.
-    """
-    return url_for("reset_password", token=token, _external=True)
 
 
 # ================================================================
@@ -231,249 +197,190 @@ def index():
 
 @app.route("/register", methods=["GET","POST"])
 def register():
-    error    = None
-    ref_code = request.args.get("ref")
+    error = None; ref_code = request.args.get("ref")
     if request.method == "POST":
-        email       = request.form.get("email")
-        username    = request.form.get("username")
-        password    = request.form.get("password")
-        phone       = request.form.get("phone")
-        referred_by = request.form.get("ref")
-        conn = get_db_connection()
-        if conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
-            error = "Email already exists"
-        elif conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
-            error = "Username already taken"
-        if error:
-            conn.close()
-            return render_template("register.html", error=error, ref_code=ref_code)
-        conn.execute(
-            "INSERT INTO users (email,username,password_hash,phone,referral_code,referred_by,joined_at) VALUES (?,?,?,?,?,?,?)",
-            (email, username, generate_password_hash(password), phone,
-             f"GP-{uuid.uuid4().hex.upper()[:5]}", referred_by or None,
-             datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-        )
+        email=request.form.get("email"); username=request.form.get("username")
+        password=request.form.get("password"); phone=request.form.get("phone")
+        referred_by=request.form.get("ref")
+        conn=get_db_connection()
+        if conn.execute("SELECT 1 FROM users WHERE email=?",(email,)).fetchone(): error="Email already exists"
+        elif conn.execute("SELECT 1 FROM users WHERE username=?",(username,)).fetchone(): error="Username already taken"
+        if error: conn.close(); return render_template("register.html",error=error,ref_code=ref_code)
+        conn.execute("INSERT INTO users (email,username,password_hash,phone,referral_code,referred_by,joined_at) VALUES (?,?,?,?,?,?,?)",
+            (email,username,generate_password_hash(password),phone,f"GP-{uuid.uuid4().hex.upper()[:5]}",
+             referred_by or None,datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
         conn.commit(); conn.close()
-        session["user_email"] = email
+        session["user_email"]=email
         return redirect(url_for("pay_page"))
-    return render_template("register.html", ref_code=ref_code)
+    return render_template("register.html",ref_code=ref_code)
 
 
 @app.route("/login", methods=["GET","POST"])
 def login():
-    error = request.args.get("error")
-    if request.method == "POST":
-        credential = request.form.get("credential")
-        password   = request.form.get("password")
-        conn = get_db_connection()
-        user = conn.execute("SELECT * FROM users WHERE email=? OR username=?", (credential, credential)).fetchone()
+    error=request.args.get("error")
+    if request.method=="POST":
+        credential=request.form.get("credential"); password=request.form.get("password")
+        conn=get_db_connection()
+        user=conn.execute("SELECT * FROM users WHERE email=? OR username=?",(credential,credential)).fetchone()
         conn.close()
-        if not user or not check_password_hash(user["password_hash"], password):
-            error = "Invalid credentials"
+        if not user or not check_password_hash(user["password_hash"],password): error="Invalid credentials"
         else:
-            session["user_email"] = user["email"]
+            session["user_email"]=user["email"]
             return redirect(url_for("dashboard") if user["is_active"] else url_for("pay_page"))
-    return render_template("register.html", error=error)
+    return render_template("register.html",error=error)
 
 
 # ================================================================
-# PASSWORD RESET  — works on localhost AND Render
+# PASSWORD RESET
 # ================================================================
 
 @app.route("/forgot-password", methods=["GET","POST"])
 def forgot_password():
-    """
-    POST → look up user, generate token, send email, flash, redirect (PRG).
-    GET  → render form. Flash message from the redirect lands here cleanly.
-    """
-    if request.method == "POST":
-        email = request.form.get("email", "").strip().lower()
-        conn  = get_db_connection()
+    if request.method=="POST":
+        email=request.form.get("email","").strip().lower()
+        conn=get_db_connection()
         try:
-            user = conn.execute("SELECT email FROM users WHERE LOWER(email)=?", (email,)).fetchone()
+            user=conn.execute("SELECT email FROM users WHERE LOWER(email)=?",(email,)).fetchone()
             if user:
-                token      = serializer.dumps(user["email"], salt="gainpesa-password-reset")
-                reset_link = build_reset_url(token)
-                email_sent = send_reset_email(user["email"], reset_link)
-                if email_sent:
-                    flash("Reset link sent — check your inbox (and spam folder).", "info")
-                else:
-                    flash(
-                        "Request received. If your email is registered, check your inbox. "
-                        "If no email arrives within a few minutes, contact support.",
-                        "info"
-                    )
+                token=serializer.dumps(user["email"],salt="gainpesa-password-reset")
+                reset_link=url_for("reset_password",token=token,_external=True)
+                sent=send_reset_email(user["email"],reset_link)
+                flash("Reset link sent — check your inbox and spam folder." if sent
+                      else "Request received. Check your inbox — if nothing arrives, contact support.","info")
             else:
-                # Same message whether user exists or not — prevents enumeration
-                flash("Request received. If your email is registered, a reset link has been sent.", "info")
+                flash("If that email is registered, a reset link has been sent.","info")
         except Exception as e:
             app.logger.error(f"[ForgotPassword] {e}")
-            flash("Something went wrong. Please try again.", "error")
+            flash("Something went wrong. Please try again.","error")
         finally:
             conn.close()
-
-        # PRG: redirect to GET so flash shows and F5 doesn't resubmit the form
         return redirect(url_for("forgot_password"))
-
-    # GET: flash from the redirect above displays here
     return render_template("forgot_password.html")
 
 
 @app.route("/reset-password/<token>", methods=["GET","POST"])
 def reset_password(token):
-    # ── 1. Validate token ────────────────────────────────────────
     try:
-        email = serializer.loads(token, salt="gainpesa-password-reset", max_age=3600)
+        email=serializer.loads(token,salt="gainpesa-password-reset",max_age=3600)
     except SignatureExpired:
-        flash("Reset link expired (1-hour limit). Request a new one.", "error")
+        flash("Reset link expired (1-hour limit). Request a new one.","error")
         return redirect(url_for("forgot_password"))
-    except (BadSignature, Exception):
-        flash("Invalid or already-used reset link. Request a new one.", "error")
+    except (BadSignature,Exception):
+        flash("Invalid or already-used reset link. Request a new one.","error")
         return redirect(url_for("forgot_password"))
 
-    # ── 2. Confirm user exists ───────────────────────────────────
-    conn = get_db_connection()
-    user = conn.execute("SELECT email FROM users WHERE email=?", (email,)).fetchone()
+    conn=get_db_connection()
+    user=conn.execute("SELECT email FROM users WHERE email=?",(email,)).fetchone()
     if not user:
-        conn.close()
-        flash("Account not found.", "error")
-        return redirect(url_for("login"))
+        conn.close(); flash("Account not found.","error"); return redirect(url_for("login"))
 
-    # ── 3. Handle POST ───────────────────────────────────────────
-    if request.method == "POST":
-        new_pw  = request.form.get("password", "")
-        conf_pw = request.form.get("confirm_password", "")
-
-        if len(new_pw) < 6:
-            conn.close()
-            return render_template("reset_password.html", token=token,
-                                   error="Password must be at least 6 characters.")
-        if new_pw != conf_pw:
-            conn.close()
-            return render_template("reset_password.html", token=token,
-                                   error="Passwords do not match.")
+    if request.method=="POST":
+        new_pw=request.form.get("password",""); conf_pw=request.form.get("confirm_password","")
+        if len(new_pw)<6:
+            conn.close(); return render_template("reset_password.html",token=token,error="Password must be at least 6 characters.")
+        if new_pw!=conf_pw:
+            conn.close(); return render_template("reset_password.html",token=token,error="Passwords do not match.")
         try:
-            conn.execute("UPDATE users SET password_hash=? WHERE email=?",
-                         (generate_password_hash(new_pw), email))
+            conn.execute("UPDATE users SET password_hash=? WHERE email=?",(generate_password_hash(new_pw),email))
             conn.commit()
         except Exception as e:
-            app.logger.error(f"[ResetPassword] DB error: {e}")
-            conn.close()
-            return render_template("reset_password.html", token=token,
-                                   error="Could not save new password. Please try again.")
-        conn.close()
-        flash("✓ Password updated! You can now log in.", "success")
+            app.logger.error(f"[ResetPassword] {e}"); conn.close()
+            return render_template("reset_password.html",token=token,error="Could not save password. Try again.")
+        conn.close(); flash("✓ Password updated! You can now log in.","success")
         return redirect(url_for("login"))
 
     conn.close()
-    return render_template("reset_password.html", token=token)
+    return render_template("reset_password.html",token=token)
 
 
 @app.route("/logout")
 def logout():
-    session.clear()
-    return redirect(url_for("login"))
+    session.clear(); return redirect(url_for("login"))
 
 
 @app.route("/pay")
 @login_required
 def pay_page():
-    conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE email=?", (session["user_email"],)).fetchone()
-    conn.close()
-    return render_template("pay.html", user=dict(user))
+    conn=get_db_connection()
+    user=conn.execute("SELECT * FROM users WHERE email=?",(session["user_email"],)).fetchone()
+    conn.close(); return render_template("pay.html",user=dict(user))
 
 
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE email=?", (session["user_email"],)).fetchone()
+    conn=get_db_connection()
+    user=conn.execute("SELECT * FROM users WHERE email=?",(session["user_email"],)).fetchone()
     conn.close()
     if not user["is_active"]: return redirect(url_for("pay_page"))
-    return render_template("dashboard.html", user=dict(user))
+    return render_template("dashboard.html",user=dict(user))
 
 
 @app.route("/gainbinary")
 @login_required
 def gainbinary():
-    conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE email=?", (session["user_email"],)).fetchone()
+    conn=get_db_connection()
+    user=conn.execute("SELECT * FROM users WHERE email=?",(session["user_email"],)).fetchone()
     conn.close()
     if not user["is_active"]: return redirect(url_for("pay_page"))
-    return render_template("gainbinary.html", user=dict(user))
+    return render_template("gainbinary.html",user=dict(user))
 
 
-# ================================================================
-# PAYMENT: ACTIVATION
-# ================================================================
-
-@app.route("/api/initiate-payment", methods=["POST"])
+@app.route("/api/initiate-payment",methods=["POST"])
 @login_required
 def initiate_payment():
-    conn  = get_db_connection()
-    phone = conn.execute("SELECT phone FROM users WHERE email=?", (session["user_email"],)).fetchone()["phone"]
+    conn=get_db_connection()
+    phone=conn.execute("SELECT phone FROM users WHERE email=?",(session["user_email"],)).fetchone()["phone"]
     conn.close()
-    if phone.startswith("0"): phone = "254"+phone[1:]
-    elif phone.startswith("+"): phone = phone[1:]
-    ext_ref = "GP-ACT-"+uuid.uuid4().hex[:6].upper()
+    if phone.startswith("0"): phone="254"+phone[1:]
+    elif phone.startswith("+"): phone=phone[1:]
+    ext_ref="GP-ACT-"+uuid.uuid4().hex[:6].upper()
     try:
-        r = requests.post(f"{PAYHERO_BASE_URL}/payments", json={
-            "amount":ACTIVATION_FEE,"phone_number":phone,"channel_id":PAYHERO_CHANNEL_ID,
-            "provider":PAYHERO_PROVIDER,"external_reference":ext_ref,"callback_url":CALLBACK_URL
-        }, headers={"Content-Type":"application/json","Authorization":get_auth_header()})
+        r=requests.post(f"{PAYHERO_BASE_URL}/payments",json={"amount":ACTIVATION_FEE,"phone_number":phone,
+            "channel_id":PAYHERO_CHANNEL_ID,"provider":PAYHERO_PROVIDER,"external_reference":ext_ref,"callback_url":CALLBACK_URL},
+            headers={"Content-Type":"application/json","Authorization":get_auth_header()})
         if r.status_code in [200,201]:
-            conn = get_db_connection()
+            conn=get_db_connection()
             conn.execute("INSERT INTO transactions (ext_ref,email,type,status,amount) VALUES (?,?,?,?,?)",
                          (ext_ref,session["user_email"],"activation","pending",ACTIVATION_FEE))
-            conn.commit(); conn.close()
-            return jsonify({"success":True,"reference":ext_ref})
+            conn.commit(); conn.close(); return jsonify({"success":True,"reference":ext_ref})
         return jsonify({"success":False,"error":r.text})
-    except Exception as e:
-        return jsonify({"success":False,"error":str(e)})
+    except Exception as e: return jsonify({"success":False,"error":str(e)})
 
 
 @app.route("/api/reconcile/<ext_ref>")
 @login_required
 def reconcile(ext_ref):
-    conn = get_db_connection()
-    tx   = conn.execute("SELECT status FROM transactions WHERE ext_ref=? AND email=?",
-                        (ext_ref,session["user_email"])).fetchone()
+    conn=get_db_connection()
+    tx=conn.execute("SELECT status FROM transactions WHERE ext_ref=? AND email=?",(ext_ref,session["user_email"])).fetchone()
     conn.close()
     if not tx: return jsonify({"status":"not_found"}),404
-    return jsonify({"status":"confirmed" if tx["status"]=="confirmed"
-                    else "canceled" if tx["status"]=="failed" else "pending"})
+    return jsonify({"status":"confirmed" if tx["status"]=="confirmed" else "canceled" if tx["status"]=="failed" else "pending"})
 
 
-@app.route("/api/binary/deposit", methods=["POST"])
+@app.route("/api/binary/deposit",methods=["POST"])
 @login_required
 def initiate_binary_deposit():
-    amount = float(request.json.get("amount",0)); email = session["user_email"]
-    if amount < MIN_BINARY_DEPOSIT_KES:
-        return jsonify({"error":f"Minimum deposit is Ksh {MIN_BINARY_DEPOSIT_KES:.0f} (~1 USD)"}),400
-    conn  = get_db_connection()
-    phone = conn.execute("SELECT phone FROM users WHERE email=?", (email,)).fetchone()["phone"]
-    conn.close()
-    if phone.startswith("0"): phone = "254"+phone[1:]
-    elif phone.startswith("+"): phone = phone[1:]
-    ext_ref = "GP-BIN-"+uuid.uuid4().hex[:6].upper()
+    amount=float(request.json.get("amount",0)); email=session["user_email"]
+    if amount<MIN_BINARY_DEPOSIT_KES: return jsonify({"error":f"Minimum deposit is Ksh {MIN_BINARY_DEPOSIT_KES:.0f} (~1 USD)"}),400
+    conn=get_db_connection()
+    phone=conn.execute("SELECT phone FROM users WHERE email=?",(email,)).fetchone()["phone"]; conn.close()
+    if phone.startswith("0"): phone="254"+phone[1:]
+    elif phone.startswith("+"): phone=phone[1:]
+    ext_ref="GP-BIN-"+uuid.uuid4().hex[:6].upper()
     try:
-        r = requests.post(f"{PAYHERO_BASE_URL}/payments", json={
-            "amount":amount,"phone_number":phone,"channel_id":PAYHERO_CHANNEL_ID,
-            "provider":PAYHERO_PROVIDER,"external_reference":ext_ref,"callback_url":CALLBACK_URL
-        }, headers={"Content-Type":"application/json","Authorization":get_auth_header()})
+        r=requests.post(f"{PAYHERO_BASE_URL}/payments",json={"amount":amount,"phone_number":phone,
+            "channel_id":PAYHERO_CHANNEL_ID,"provider":PAYHERO_PROVIDER,"external_reference":ext_ref,"callback_url":CALLBACK_URL},
+            headers={"Content-Type":"application/json","Authorization":get_auth_header()})
         if r.status_code in [200,201]:
-            conn = get_db_connection()
-            conn.execute("INSERT INTO transactions (ext_ref,email,type,status,amount) VALUES (?,?,?,?,?)",
-                         (ext_ref,email,"binary_deposit","pending",amount))
-            conn.commit(); conn.close()
-            return jsonify({"success":True,"reference":ext_ref})
+            conn=get_db_connection()
+            conn.execute("INSERT INTO transactions (ext_ref,email,type,status,amount) VALUES (?,?,?,?,?)",(ext_ref,email,"binary_deposit","pending",amount))
+            conn.commit(); conn.close(); return jsonify({"success":True,"reference":ext_ref})
         return jsonify({"success":False,"error":r.text})
-    except Exception as e:
-        return jsonify({"success":False,"error":str(e)})
+    except Exception as e: return jsonify({"success":False,"error":str(e)})
 
 
-@app.route("/callback", methods=["POST"])
+@app.route("/callback",methods=["POST"])
 def callback():
     data=request.json; res=data.get("response") or data
     ext_ref=res.get("ExternalReference"); status=res.get("Status"); cb_amount=float(res.get("Amount",0))
@@ -500,7 +407,7 @@ def callback():
     conn.commit(); conn.close(); return jsonify({"status":"ok"})
 
 
-@app.route("/api/binary/trade", methods=["POST"])
+@app.route("/api/binary/trade",methods=["POST"])
 @login_required
 def execute_binary_trade():
     data=request.json; email=session["user_email"]; amount=float(data.get("amount",0))
@@ -512,7 +419,7 @@ def execute_binary_trade():
     conn.commit(); conn.close(); return jsonify({"success":True,"status":"loss","payout":0,"profit":0})
 
 
-@app.route("/api/binary/claim-winnings", methods=["POST"])
+@app.route("/api/binary/claim-winnings",methods=["POST"])
 @login_required
 def claim_binary_winnings():
     email=session["user_email"]; amount=float(request.json.get("amount",0))
@@ -524,7 +431,7 @@ def claim_binary_winnings():
     conn.commit(); conn.close(); return jsonify({"success":True})
 
 
-@app.route("/api/binary/transfer", methods=["POST"])
+@app.route("/api/binary/transfer",methods=["POST"])
 @login_required
 def transfer_to_binary():
     amount=float(request.json.get("amount",0)); email=session["user_email"]
@@ -534,7 +441,7 @@ def transfer_to_binary():
     conn.commit(); conn.close(); return jsonify({"success":True})
 
 
-@app.route("/api/user", methods=["GET"])
+@app.route("/api/user",methods=["GET"])
 @login_required
 def get_user_data():
     conn=get_db_connection()
@@ -549,7 +456,7 @@ def get_user_data():
         "withdrawals":[dict(w) for w in withdrawals]})
 
 
-@app.route("/api/withdraw", methods=["POST"])
+@app.route("/api/withdraw",methods=["POST"])
 @login_required
 def submit_withdraw():
     email=session["user_email"]; amount=float(request.json.get("amount",0)); mpesa=request.json.get("mpesa","")
@@ -563,11 +470,7 @@ def submit_withdraw():
     conn.commit(); conn.close(); return jsonify({"success":True})
 
 
-# ================================================================
-# ADMIN
-# ================================================================
-
-@app.route("/admin/login", methods=["GET","POST"])
+@app.route("/admin/login",methods=["GET","POST"])
 def admin_login():
     if request.method=="POST":
         if request.form.get("username")=="MACK" and request.form.get("password")=="AJEGA":
@@ -587,7 +490,7 @@ def admin_dashboard():
                            withdrawals=[dict(w) for w in withdrawals],recent_updates=[dict(r) for r in recent_updates])
 
 
-@app.route("/admin/update-balance", methods=["POST"])
+@app.route("/admin/update-balance",methods=["POST"])
 def admin_update_balance():
     if not session.get("is_admin"): return jsonify({"error":"Unauthorized"}),403
     email=request.json.get("email"); amt=float(request.json.get("balance",0))
@@ -598,7 +501,7 @@ def admin_update_balance():
     conn.commit(); conn.close(); return jsonify({"success":True})
 
 
-@app.route("/admin/update-trading", methods=["POST"])
+@app.route("/admin/update-trading",methods=["POST"])
 def admin_update_trading():
     if not session.get("is_admin"): return jsonify({"error":"Unauthorized"}),403
     email=request.json.get("email"); amt=float(request.json.get("amount",0))
@@ -609,7 +512,7 @@ def admin_update_trading():
     conn.commit(); conn.close(); return jsonify({"success":True})
 
 
-@app.route("/admin/mark-paid", methods=["POST"])
+@app.route("/admin/mark-paid",methods=["POST"])
 def admin_mark_paid():
     if not session.get("is_admin"): return jsonify({"error":"Unauthorized"}),403
     conn=get_db_connection()
@@ -638,7 +541,7 @@ def download_users_pdf(status):
     resp.headers.set('Content-Type','application/pdf'); return resp
 
 
-@app.route("/admin/activate-user", methods=["POST"])
+@app.route("/admin/activate-user",methods=["POST"])
 def admin_activate_user():
     if not session.get("is_admin"): return jsonify({"error":"Unauthorized"}),403
     email=request.json.get("email"); conn=get_db_connection()
