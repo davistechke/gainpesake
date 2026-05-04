@@ -5,7 +5,7 @@ import os
 import sqlite3
 import uuid
 import requests
-import logging
+import resend
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for, make_response, flash
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -28,43 +28,18 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE']   = bool(os.getenv("RENDER"))
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 
-# ── Flask-Mail ─────────────────────────────────────────────────────────────────
-MAIL_ENABLED = False
-mail         = None
-_MailMessage = None
-
-# Read WITHOUT any default — empty string would pass the `if` check falsely
-_mail_user = os.getenv("MAIL_USERNAME")
-_mail_pass = os.getenv("MAIL_PASSWORD")
-
-print(f"[Mail] MAIL_USERNAME = {_mail_user!r}")
-print(f"[Mail] MAIL_PASSWORD = {'SET (' + str(len(_mail_pass)) + ' chars)' if _mail_pass else 'NOT SET'}")
-
-if _mail_user and _mail_pass:
-    try:
-        from flask_mail import Mail, Message as __Msg
-        app.config.update(
-            MAIL_SERVER         = os.getenv("MAIL_SERVER", "smtp.gmail.com"),
-            MAIL_PORT           = int(os.getenv("MAIL_PORT", 587)),
-            MAIL_USE_TLS        = True,
-            MAIL_USE_SSL        = False,
-            MAIL_USERNAME       = _mail_user,
-            MAIL_PASSWORD       = _mail_pass,
-            MAIL_DEFAULT_SENDER = os.getenv("MAIL_DEFAULT_SENDER", _mail_user),
-            MAIL_SUPPRESS_SEND  = False,
-        )
-        mail         = Mail(app)
-        _MailMessage = __Msg
-        MAIL_ENABLED = True
-        print(f"[Mail] READY — sender: {_mail_user}")
-    except Exception as e:
-        print(f"[Mail] INIT FAILED: {e}")
+# ── Resend API (HTTPS — works on Render free tier, unlike SMTP) ───────────────
+_resend_key = os.getenv("RESEND_API_KEY")
+if _resend_key:
+    resend.api_key = _resend_key
+    print(f"[Resend] ✓ API key loaded")
 else:
-    print("[Mail] DISABLED — set MAIL_USERNAME and MAIL_PASSWORD env vars on Render")
+    print("[Resend] ✗ RESEND_API_KEY not set — reset links will print to logs only")
 
+# ── Token serializer ──────────────────────────────────────────────────────────
 serializer = URLSafeTimedSerializer(app.secret_key)
 
-# ── PayHero ────────────────────────────────────────────────────────────────────
+# ── PayHero ───────────────────────────────────────────────────────────────────
 PAYHERO_BASE_URL   = os.getenv("PAYHERO_BASE_URL",   "https://backend.payhero.co.ke/api/v2")
 PAYHERO_CHANNEL_ID = os.getenv("PAYHERO_CHANNEL_ID", "6532")
 PAYHERO_PROVIDER   = os.getenv("PAYHERO_PROVIDER",   "m-pesa")
@@ -81,7 +56,7 @@ def get_auth_header():
     return f"Basic {base64.b64encode(f'{API_USERNAME}:{API_PASSWORD}'.encode()).decode()}"
 
 
-# ── Database ───────────────────────────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────────────
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -168,22 +143,33 @@ def login_required(f):
     return decorated
 
 
-def send_reset_email(to_email, reset_link):
-    if MAIL_ENABLED and mail and _MailMessage:
-        try:
-            msg = _MailMessage(subject="GainPesa – Password Reset Request", recipients=[to_email])
-            msg.body = (
-                f"Hello,\n\nClick below to reset your GainPesa password (valid 1 hour):\n\n"
-                f"{reset_link}\n\nIgnore this if you didn't request it.\n\n– GainPesa Team"
-            )
-            mail.send(msg)
-            print(f"[Mail] ✓ Sent to {to_email}")
-            return True
-        except Exception as e:
-            print(f"[Mail] ✗ SMTP error: {e}")
-            app.logger.error(f"[Mail] SMTP error → {to_email}: {e}")
-    print(f"\n{'='*65}\n[RESET LINK] To: {to_email}\n{reset_link}\n{'='*65}\n")
-    return False
+# ── Email helper (uses Resend HTTPS API — not blocked by Render) ──────────────
+def send_reset_email(to_email: str, reset_link: str) -> bool:
+    if not _resend_key:
+        print(f"\n{'='*65}\n[RESET LINK] To: {to_email}\n{reset_link}\n{'='*65}\n")
+        return False
+    try:
+        from_addr = os.getenv("RESEND_FROM", "GainPesa <onboarding@resend.dev>")
+        params = {
+            "from": from_addr,
+            "to": [to_email],
+            "subject": "GainPesa – Password Reset Request",
+            "text": (
+                f"Hello,\n\n"
+                f"Click the link below to reset your GainPesa password (valid 1 hour):\n\n"
+                f"{reset_link}\n\n"
+                f"If you did not request this, ignore this email.\n\n"
+                f"– The GainPesa Team"
+            ),
+        }
+        resp = resend.Emails.send(params)
+        print(f"[Resend] ✓ Sent to {to_email} | id={resp.get('id','?')}")
+        return True
+    except Exception as e:
+        app.logger.error(f"[Resend] ✗ {e}")
+        print(f"[Resend] ✗ {e}")
+        print(f"\n{'='*65}\n[RESET LINK] To: {to_email}\n{reset_link}\n{'='*65}\n")
+        return False
 
 
 # ================================================================
@@ -206,9 +192,11 @@ def register():
         if conn.execute("SELECT 1 FROM users WHERE email=?",(email,)).fetchone(): error="Email already exists"
         elif conn.execute("SELECT 1 FROM users WHERE username=?",(username,)).fetchone(): error="Username already taken"
         if error: conn.close(); return render_template("register.html",error=error,ref_code=ref_code)
-        conn.execute("INSERT INTO users (email,username,password_hash,phone,referral_code,referred_by,joined_at) VALUES (?,?,?,?,?,?,?)",
-            (email,username,generate_password_hash(password),phone,f"GP-{uuid.uuid4().hex.upper()[:5]}",
-             referred_by or None,datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+        conn.execute(
+            "INSERT INTO users (email,username,password_hash,phone,referral_code,referred_by,joined_at) VALUES (?,?,?,?,?,?,?)",
+            (email,username,generate_password_hash(password),phone,
+             f"GP-{uuid.uuid4().hex.upper()[:5]}",referred_by or None,
+             datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
         conn.commit(); conn.close()
         session["user_email"]=email
         return redirect(url_for("pay_page"))
@@ -246,7 +234,7 @@ def forgot_password():
                 reset_link=url_for("reset_password",token=token,_external=True)
                 sent=send_reset_email(user["email"],reset_link)
                 flash("Reset link sent — check your inbox and spam folder." if sent
-                      else "Request received. Check your inbox — if nothing arrives, contact support.","info")
+                      else "Request received. Check your inbox shortly.","info")
             else:
                 flash("If that email is registered, a reset link has been sent.","info")
         except Exception as e:
@@ -277,9 +265,11 @@ def reset_password(token):
     if request.method=="POST":
         new_pw=request.form.get("password",""); conf_pw=request.form.get("confirm_password","")
         if len(new_pw)<6:
-            conn.close(); return render_template("reset_password.html",token=token,error="Password must be at least 6 characters.")
+            conn.close()
+            return render_template("reset_password.html",token=token,error="Password must be at least 6 characters.")
         if new_pw!=conf_pw:
-            conn.close(); return render_template("reset_password.html",token=token,error="Passwords do not match.")
+            conn.close()
+            return render_template("reset_password.html",token=token,error="Passwords do not match.")
         try:
             conn.execute("UPDATE users SET password_hash=? WHERE email=?",(generate_password_hash(new_pw),email))
             conn.commit()
